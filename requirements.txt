@@ -1,5 +1,7 @@
+python-dotenv
+python-binance
 gymnasium
 stable-baselines3
-python-binance
+shimmy
 pandas
-python-dotenv
+numpy
