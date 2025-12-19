@@ -2,169 +2,139 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 from collections import deque
-from config import INITIAL_BALANCE, TRADE_AMOUNT
+import time
 
 class BinanceTradingEnv(gym.Env):
-    def __init__(self, data_stream, max_steps=1000):
+    def __init__(self, data_stream, max_steps=1000, initial_balance=1000):
         super(BinanceTradingEnv, self).__init__()
         self.data_stream = data_stream
         self.max_steps = max_steps
+        self.initial_balance = initial_balance
         
-        # Action space: 0 = Hold, 1 = Buy/Long, 2 = Sell/Exit
+        # Action space: 0 = Hold, 1 = Buy, 2 = Sell
         self.action_space = spaces.Discrete(3)
         
-        # Observation space: order book (80) + OBI (1) + price_vs_vwap (1) + RSI (1) = 83
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(83,), dtype=np.float32)
+        # 83 Features: [40 LOB values] + [OBI, VWAP_Diff, RSI]
+        self.observation_space = spaces.Box(low=-5, high=5, shape=(83,), dtype=np.float32)
         
-        # Fees: 0.1% taker fee
-        self.FEE = 0.001
-        
-        # Initialize state
-        self.balance = INITIAL_BALANCE
-        self.position = 0.0  # BTC held
-        self.current_price = 0.0
-        self.step_count = 0
-        self.total_profit = 0.0
-        self.cost_basis = 0.0  # Average cost per BTC
-        self.steps_held = 0
-        
-        # For indicators
-        self.price_history = deque(maxlen=14)  # For RSI
-        self.vwap_cum_price_vol = 0.0
-        self.vwap_cum_vol = 0.0
-        self.prev_rsi = 50.0  # Initial RSI
-        
+        self.FEE = 0.00075  # 0.075% (Binance BNB fee)
+
     def reset(self, seed=None, options=None):
+        """Resets the environment and returns (observation, info)."""
         super().reset(seed=seed)
-        # Reset environment state
-        self.balance = INITIAL_BALANCE
-        self.position = 0.0
+        self.balance = self.initial_balance
+        self.position = 0.0 
         self.current_price = 0.0
         self.step_count = 0
-        self.total_profit = 0.0
         self.cost_basis = 0.0
         self.steps_held = 0
+        self.net_worth = self.initial_balance
         
-        # Reset indicators
-        self.price_history.clear()
+        self.price_history = deque(maxlen=15)
         self.vwap_cum_price_vol = 0.0
         self.vwap_cum_vol = 0.0
-        self.prev_rsi = 50.0
         
-        obs = self._get_observation()
-        return obs, {}
-    
+        # --- FIX: WAIT FOR REAL-TIME DATA ---
+        # Prevents ZeroDivisionError by ensuring WebSocket data has arrived
+        print("Waiting for initial market price from WebSocket...")
+        while self.current_price == 0:
+            order_book = self.data_stream.get_order_book()
+            bids = order_book.get('bids', [])
+            asks = order_book.get('asks', [])
+            
+            if bids and asks:
+                self.current_price = (float(bids[0][0]) + float(asks[0][0])) / 2
+            else:
+                time.sleep(0.5) # Wait for stream to populate
+
+        # Return (obs, info) as required by Gymnasium
+        return self._get_observation(), {"net_worth": self.net_worth}
+
     def step(self, action):
+        """Executes action and returns (obs, reward, terminated, truncated, info)."""
         self.step_count += 1
+        prev_net_worth = self.net_worth
         
-        # Update holding time
+        # 1. Execute Actions
+        if action == 1:  # BUY
+            amount_to_buy = self.balance / (self.current_price * (1 + self.FEE))
+            if amount_to_buy > 0:
+                self.position += amount_to_buy
+                self.balance = 0
+                self.cost_basis = self.current_price
+                self.steps_held = 0
+        
+        elif action == 2: # SELL
+            if self.position > 0:
+                self.balance = self.position * self.current_price * (1 - self.FEE)
+                self.position = 0
+                self.cost_basis = 0
+                self.steps_held = 0
+
+        # 2. Update Environment State
         if self.position > 0:
             self.steps_held += 1
-        
-        # Execute action
-        reward = 0.0
-        if action == 1:  # Buy/Long
-            cost = TRADE_AMOUNT * self.current_price * (1 + self.FEE)
-            if self.balance >= cost:
-                # Update cost basis
-                total_cost = self.position * self.cost_basis + cost
-                self.position += TRADE_AMOUNT
-                self.cost_basis = total_cost / self.position
-                self.balance -= cost
-        elif action == 2:  # Sell/Exit
-            if self.position >= TRADE_AMOUNT:
-                revenue = TRADE_AMOUNT * self.current_price * (1 - self.FEE)
-                # Calculate profit for this trade
-                trade_profit = (self.current_price - self.cost_basis) * TRADE_AMOUNT - (self.current_price * TRADE_AMOUNT * self.FEE * 2)  # Fee on buy and sell
-                self.total_profit += trade_profit
-                self.balance += revenue
-                self.position -= TRADE_AMOUNT
-                if self.position == 0:
-                    self.cost_basis = 0.0
-                    self.steps_held = 0
-        
-        # Get new observation
+            
         obs = self._get_observation()
+        self.net_worth = self.balance + (self.position * self.current_price)
         
-        # Calculate reward: Profit after fees - Holding Time Penalty
-        holding_penalty = 0.001 * self.steps_held if self.position > 0 else 0.0
-        reward = self.total_profit - holding_penalty
+        # 3. HIGH-END REWARD LOGIC
+        # Prevents division by zero if net worth drops to zero
+        step_return = (self.net_worth - prev_net_worth) / (prev_net_worth + 1e-9)
+        holding_penalty = 0.0001 * self.steps_held if self.position > 0 else 0
+        reward = step_return - holding_penalty
         
-        # Check if done
-        done = self.step_count >= self.max_steps or self.balance <= 0
+        # 4. TERMINATION vs TRUNCATION
+        terminated = self.step_count >= self.max_steps # Natural end
+        truncated = self.net_worth < (self.initial_balance * 0.7) # Safety end (30% loss)
         
-        return obs, reward, done, False, {}
-    
+        # Return 5 values
+        return obs, float(reward), terminated, truncated, {"net_worth": self.net_worth}
+
     def _get_observation(self):
-        # Get current order book
+        """Constructs the stationarized observation vector."""
         order_book = self.data_stream.get_order_book()
-        
-        # Extract top 20 bids and asks
         bids = order_book.get('bids', [])[:20]
         asks = order_book.get('asks', [])[:20]
         
-        # Pad if necessary
-        while len(bids) < 20:
-            bids.append([0.0, 0.0])
-        while len(asks) < 20:
-            asks.append([0.0, 0.0])
-        
-        # Update current price (mid price)
+        # Safe Mid-Price Update
         if bids and asks:
             self.current_price = (float(bids[0][0]) + float(asks[0][0])) / 2
         
-        # Update price history for RSI
+        # Padding for LOB consistency
+        while len(bids) < 20: bids.append([bids[-1][0] if bids else self.current_price, 0])
+        while len(asks) < 20: asks.append([asks[-1][0] if asks else self.current_price, 0])
+        
+        # --- STATIONARY FEATURE ENGINEERING ---
+        # Normalize Prices relative to current Mid Price
+        normalized_lob = []
+        for p, v in bids:
+            normalized_lob.extend([(float(p) / (self.current_price + 1e-9)) - 1, np.log1p(float(v))])
+        for p, v in asks:
+            normalized_lob.extend([(float(p) / (self.current_price + 1e-9)) - 1, np.log1p(float(v))])
+            
+        # Technical Indicators
         self.price_history.append(self.current_price)
+        rsi = self._calculate_rsi() / 100.0
         
-        # Update VWAP (assume volume = TRADE_AMOUNT per step for simplicity)
-        volume = TRADE_AMOUNT
-        self.vwap_cum_price_vol += self.current_price * volume
-        self.vwap_cum_vol += volume
-        vwap = self.vwap_cum_price_vol / self.vwap_cum_vol if self.vwap_cum_vol > 0 else self.current_price
+        bid_vol = sum(float(v) for _, v in bids)
+        ask_vol = sum(float(v) for _, v in asks)
+        obi = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-9)
         
-        # Calculate OBI (Order Book Imbalance)
-        bid_vol = sum(float(vol) for _, vol in bids)
-        ask_vol = sum(float(vol) for _, vol in asks)
-        obi = (bid_vol - ask_vol) / (bid_vol + ask_vol) if (bid_vol + ask_vol) > 0 else 0.0
+        self.vwap_cum_price_vol += self.current_price
+        self.vwap_cum_vol += 1
+        vwap = self.vwap_cum_price_vol / self.vwap_cum_vol
+        vwap_diff = (self.current_price / (vwap + 1e-9)) - 1
         
-        # Calculate RSI
-        rsi = self._calculate_rsi()
-        
-        # Price vs VWAP
-        price_vs_vwap = self.current_price - vwap
-        
-        # Create observation array
-        obs = []
-        for price, volume in bids:
-            obs.extend([float(price), float(volume)])
-        for price, volume in asks:
-            obs.extend([float(price), float(volume)])
-        obs.extend([obi, price_vs_vwap, rsi])
-        
-        return np.array(obs, dtype=np.float32)
-    
-    def _calculate_rsi(self):
-        if len(self.price_history) < 2:
-            return 50.0
-        
-        gains = []
-        losses = []
-        for i in range(1, len(self.price_history)):
-            change = self.price_history[i] - self.price_history[i-1]
-            if change > 0:
-                gains.append(change)
-                losses.append(0)
-            else:
-                gains.append(0)
-                losses.append(-change)
-        
-        avg_gain = sum(gains) / len(gains) if gains else 0
-        avg_loss = sum(losses) / len(losses) if losses else 0
-        
-        if avg_loss == 0:
-            rs = 100
-        else:
-            rs = avg_gain / avg_loss
-        
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
+        full_obs = np.array(normalized_lob + [obi, vwap_diff, rsi], dtype=np.float32)
+        return np.clip(full_obs, -5, 5)
+
+    def _calculate_rsi(self, window=14):
+        if len(self.price_history) < window: return 50.0
+        prices = np.array(self.price_history)
+        deltas = np.diff(prices)
+        up = deltas[deltas > 0].sum() / window
+        down = -deltas[deltas < 0].sum() / window
+        if down == 0: return 100.0
+        rs = up / (down + 1e-9)
+        return 100.0 - (100.0 / (1.0 + rs))
