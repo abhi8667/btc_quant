@@ -1,134 +1,79 @@
-from binance.client import Client
-from binance.websockets import BinanceSocketManager
 import time
+from binance import ThreadedWebsocketManager
 from collections import deque
-import threading
+import numpy as np
 
 class DataStream:
-    def __init__(self, api_key, api_secret, symbol):
-        self.client = Client(api_key, api_secret)
-        self.symbol = symbol
-        self.order_book = {'bids': [], 'asks': []}
-        self.tick_buffer = deque(maxlen=6000)  # Buffer for last ~60 seconds of tick data (assuming ~100 ticks/sec max)
-        self.bm = BinanceSocketManager(self.client)
-        self.conn_key_depth = None
-        self.conn_key_trade = None
-        self.running = True
+    def __init__(self, client, symbol):
+        """
+        Initializes the data stream using a pre-configured Binance Client.
+        The client object already contains the API Key, Secret, and Testnet settings.
+        """
+        self.symbol = symbol.lower()
         
-        # Start WebSocket connections
-        self._start_connections()
+        # Initialize the ThreadedWebsocketManager using credentials from the client
+        # Accessing the api_key and api_secret stored within the Client instance
+        self.twm = ThreadedWebsocketManager(
+            api_key=client.API_KEY, 
+            api_secret=client.API_SECRET,
+            testnet=client.testnet  # Ensures the stream matches the testnet setting
+        )
         
-        # Start a thread for automatic reconnect
-        self.reconnect_thread = threading.Thread(target=self._reconnect_loop)
-        self.reconnect_thread.daemon = True
-        self.reconnect_thread.start()
+        self.order_book = {'bids': {}, 'asks': {}} # Dict for O(1) depth updates
+        self.tick_buffer = deque(maxlen=1000)
+        self.last_update_id = 0
 
-    def _start_connections(self):
-        try:
-            # Start depth socket for order book data (top 20 levels)
-            self.conn_key_depth = self.bm.start_depth_socket(
-                self.symbol, 
-                self._process_message, 
-                depth=20
-            )
-            # Start trade socket for tick data
-            self.conn_key_trade = self.bm.start_trade_socket(
-                self.symbol,
-                self._process_message
-            )
-            self.bm.start()
-            print("WebSocket connections started successfully")
-        except Exception as e:
-            print(f"Error starting connections: {e}")
-            self._reconnect()
+    def start(self):
+        """Starts the internal loop and initiates socket connections."""
+        self.twm.start() # Start is required to initialize the internal thread
+        
+        # Start Partial Book Depth Stream (Faster for RL than full diff depth)
+        self.twm.start_depth_socket(
+            callback=self._handle_depth_message, 
+            symbol=self.symbol,
+            depth=20  # Matches the observation space in your environment
+        )
+        
+        # Start Trade Stream for micro-tick data
+        self.twm.start_trade_socket(
+            callback=self._handle_trade_message, 
+            symbol=self.symbol
+        )
+        print(f"Streams started successfully for {self.symbol}")
 
-    def _process_message(self, msg):
-        try:
-            if msg['e'] == 'depthUpdate':
-                # Update order book
-                self.order_book['bids'] = msg['b']
-                self.order_book['asks'] = msg['a']
-            elif msg['e'] == 'trade':
-                # Store tick data
-                tick = {
-                    'event_time': msg['E'],
-                    'trade_time': msg['T'],
-                    'symbol': msg['s'],
-                    'price': float(msg['p']),
-                    'quantity': float(msg['q']),
-                    'buyer_order_id': msg['b'],
-                    'seller_order_id': msg['a'],
-                    'trade_id': msg['t'],
-                    'is_buyer_maker': msg['m']
-                }
-                self.tick_buffer.append(tick)
-        except Exception as e:
-            print(f"Error processing message: {e}")
+    def _handle_depth_message(self, msg):
+        """Processes partial book depth updates from the socket."""
+        # Ensure message is valid and contains bid/ask updates
+        if msg.get('e') == 'depthUpdate' or 'b' in msg:
+            # Update local order book cache with current price-quantity pairs
+            for b in msg.get('b', []):
+                self.order_book['bids'][float(b[0])] = float(b[1])
+            for a in msg.get('a', []):
+                self.order_book['asks'][float(a[0])] = float(a[1])
+            
+            # Remove levels where quantity has dropped to 0 to maintain accuracy
+            self.order_book['bids'] = {p: v for p, v in self.order_book['bids'].items() if v > 0}
+            self.order_book['asks'] = {p: v for p, v in self.order_book['asks'].items() if v > 0}
 
-    def _reconnect_loop(self):
-        while self.running:
-            time.sleep(10)  # Check every 10 seconds
-            if not self._is_connected():
-                print("Connection lost, attempting to reconnect...")
-                self._reconnect()
-
-    def _is_connected(self):
-        # Simple check - in a real implementation, you might ping or check socket status
-        return self.conn_key_depth is not None and self.conn_key_trade is not None
-
-    def _reconnect(self):
-        try:
-            self.close()
-            time.sleep(5)  # Wait before reconnecting
-            self._start_connections()
-        except Exception as e:
-            print(f"Reconnect failed: {e}")
+    def _handle_trade_message(self, msg):
+        """Processes individual trade ticks and appends to the rolling buffer."""
+        if msg.get('e') == 'trade':
+            self.tick_buffer.append({
+                'p': float(msg['p']),  # Trade price
+                'q': float(msg['q']),  # Trade quantity
+                'm': msg['m'],         # Is the buyer the market maker?
+                't': msg['T']          # Transaction time in ms
+            })
 
     def get_order_book(self):
-        return self.order_book
+        """Returns the sorted top 20 levels of the order book."""
+        # Sorted bids (Descending: Highest price first)
+        sorted_bids = sorted(self.order_book['bids'].items(), key=lambda x: x[0], reverse=True)[:20]
+        # Sorted asks (Ascending: Lowest price first)
+        sorted_asks = sorted(self.order_book['asks'].items(), key=lambda x: x[0])[:20]
+        
+        return {'bids': sorted_bids, 'asks': sorted_asks}
 
-    def get_tick_buffer(self, seconds=60):
-        """Get tick data from the last specified seconds"""
-        current_time = time.time() * 1000  # Convert to milliseconds
-        cutoff_time = current_time - (seconds * 1000)
-        return [tick for tick in self.tick_buffer if tick['event_time'] > cutoff_time]
-
-    def convert_to_observation(self, order_book=None):
-        """Convert raw order book data to observation format for RL model"""
-        import numpy as np
-        
-        if order_book is None:
-            order_book = self.get_order_book()
-        
-        # Extract top 20 bids and asks
-        bids = order_book.get('bids', [])[:20]
-        asks = order_book.get('asks', [])[:20]
-        
-        # Pad if necessary
-        while len(bids) < 20:
-            bids.append([0.0, 0.0])
-        while len(asks) < 20:
-            asks.append([0.0, 0.0])
-        
-        # Create observation array (order book part only - indicators calculated in env)
-        obs = []
-        for price, volume in bids:
-            obs.extend([float(price), float(volume)])
-        for price, volume in asks:
-            obs.extend([float(price), float(volume)])
-        
-        return np.array(obs, dtype=np.float32)
-
-    def close(self):
-        try:
-            if self.conn_key_depth:
-                self.bm.stop_socket(self.conn_key_depth)
-            if self.conn_key_trade:
-                self.bm.stop_socket(self.conn_key_trade)
-            self.bm.close()
-        except Exception as e:
-            print(f"Error closing connections: {e}")
-        finally:
-            self.conn_key_depth = None
-            self.conn_key_trade = None
-            self.running = False
+    def stop(self):
+        """Stops all active streams and terminates the threaded manager."""
+        self.twm.stop()
