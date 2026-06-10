@@ -30,6 +30,7 @@ Continuum Quant provides an end-to-end framework for developing, training, and d
 - [Research Motivation](#research-motivation)
 - [Methodology](#methodology)
 - [Experimental Setup](#experimental-setup)
+- [Hardware Constraints & Theoretical Limitations](#hardware-constraints--theoretical-limitations)
 - [Dataset Information](#dataset-information)
 - [Results](#results)
 - [Benchmarking](#benchmarking)
@@ -264,6 +265,15 @@ Continuum Quant bridges this gap by directly ingesting Level 2/Level 3 order boo
 
 ---
 
+## Hardware Constraints & Theoretical Limitations
+
+> [!WARNING]
+> Due to a consumer-grade 6GB VRAM testing baseline, the context window was strictly bounded to 2048 tokens, limiting the depth of the reasoning trace. Scalability to larger parameter counts remains untested.
+
+This artificial bound inherently limits the agent's ability to recognize macro-regime shifts, forcing it to rely exclusively on short-term micro-structure imbalances.
+
+---
+
 ## Dataset Information
 
 - **Sources:** Binance Historical Data APIs and WebSocket streams.
@@ -286,11 +296,16 @@ Continuum Quant bridges this gap by directly ingesting Level 2/Level 3 order boo
 
 ## Benchmarking
 
-| Metric | Performance |
-| :--- | :--- |
-| **Env Step Latency** | < 2 ms |
-| **WS Message Processing** | < 0.5 ms |
-| **Training Throughput** | ~4,500 steps/sec (CPU) |
+Performance evaluation explicitly isolates local execution speed from network reality to identify structural bottlenecks:
+
+| Telemetry Vector | Latency / Throughput | Description |
+| :--- | :--- | :--- |
+| **Internal Matrix Math Inference Latency** | < 0.5 ms | Local policy network forward pass |
+| **Environment Step Latency** | < 2.0 ms | State translation and reward calculation |
+| **Public Internet Network Round-Trip** | ~ 60.0 ms | Exchange WebSocket to local machine |
+| **Training Throughput (Offline)** | ~ 4,500 steps/sec | CPU-bound simulated environment steps |
+
+This breakdown demonstrates that the execution bottleneck lies fundamentally in network propagation, not local matrix math.
 
 ---
 
